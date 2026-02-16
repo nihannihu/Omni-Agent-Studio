@@ -5,6 +5,7 @@ import logging
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from starlette.concurrency import iterate_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
 from transcriber import AudioTranscriber
@@ -51,7 +52,10 @@ async def websocket_endpoint(websocket: WebSocket):
             if "bytes" in message:
                 audio_data = message["bytes"]
                 # Process audio
-                text = transcriber.transcribe(audio_data)
+                # Process audio
+                # Run blocking transcription in a separate thread to avoid freezing the WebSocket
+                loop = asyncio.get_event_loop()
+                text = await loop.run_in_executor(None, transcriber.transcribe, audio_data)
                 if text:
                     logger.info(f"Transcribed: {text}")
                     await websocket.send_json({"type": "transcription", "text": text})
@@ -59,8 +63,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Create a new agent log entry on frontend
                     await websocket.send_json({"type": "agent_response_start"})
                     
-                    # Stream tokens
-                    for token in agent.execute_stream(text):
+                    # Stream tokens (Run in threadpool to avoid blocking event loop)
+                    async for token in iterate_in_threadpool(agent.execute_stream(text)):
                         await websocket.send_json({"type": "agent_token", "text": token})
                         # Small delay to ensure distinct messages if needed, but not strictly necessary
                         await asyncio.sleep(0.01) 
@@ -75,8 +79,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     payload = json.loads(data)
                     if payload.get("type") == "screen_frame":
                          # Store latest frame for visual queries
-                         # agent.update_vision_context(payload["image"])
-                         pass
+                         if "image" in payload:
+                             agent.update_vision_context(payload["image"])
+                         # pass
                     elif payload.get("type") == "text_input":
                         text = payload.get("text")
                         if text:
@@ -84,8 +89,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             await websocket.send_json({"type": "transcription", "text": f"(Text) {text}"})
                             
                             await websocket.send_json({"type": "agent_response_start"})
-                            # Stream tokens
-                            for token in agent.execute_stream(text):
+                            # Stream tokens (Run in threadpool to avoid blocking event loop)
+                            async for token in iterate_in_threadpool(agent.execute_stream(text)):
                                 await websocket.send_json({"type": "agent_token", "text": token})
                                 await asyncio.sleep(0.01)
                             await websocket.send_json({"type": "agent_response_end"})

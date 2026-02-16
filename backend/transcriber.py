@@ -16,6 +16,11 @@ class AudioTranscriber:
 
     def transcribe(self, audio_bytes: bytes) -> str:
         try:
+            # Input Validation: Prevent huge payloads (DoS)
+            if len(audio_bytes) > 2 * 1024 * 1024:  # 2MB limit
+                logger.warning(f"Audio chunk too large: {len(audio_bytes)} bytes. Dropping.")
+                return ""
+
             # Create a temporary file to store the audio bytes
             # faster-whisper handles various formats (wav, mp3, webm, etc.) via ffmpeg
             with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_audio:

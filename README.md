@@ -10,16 +10,17 @@ Omni-Agent Studio is not just a chatbot. It is a **localized, voice-controlled A
 *   **Hearing** your voice in real-time (sub-second latency).
 *   **Thinking** through complex problems using Chain-of-Thought.
 *   **Writing & Executing** Python code safely to solve tasks.
-*   **Seeing** your screen (Experimental VLM integration).
+*   **Seeing** your screen via `SmolVLM-500M` (Hybrid CPU/GPU Vision Model).
 *   **Speaking** back with a typewriter-style interface.
 
 Built to run **100% locally** on consumer hardware (tested on NVIDIA RTX GPU), solving challenges of VRAM spillover and WebSocket concurrency.
 
 ## 🛠️ The Tech Stack
 *   **Brain:** `smolagents` (Hugging Face) + `Qwen2.5-Coder-1.5B` (4-bit Quantized).
+*   **Eyes:** `SmolVLM-500M-Instruct` (CPU Mode for stability).
 *   **Voice:** `Faster-Whisper` (V3 Turbo) for real-time transcription.
 *   **Frontend:** Next.js 14, TypeScript, TailwindCSS, Zustand.
-*   **Backend:** FastAPI, WebSockets (`uivcorn`), PyTorch.
+*   **Backend:** FastAPI, WebSockets (`uvicorn`), PyTorch.
 *   **Infrastructure:** Docker & Docker Compose.
 
 ## ✨ Key Features

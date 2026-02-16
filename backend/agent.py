@@ -2,8 +2,11 @@ import logging
 import torch
 from smolagents import CodeAgent, Tool, Model, ChatMessage, MessageRole, ChatMessageStreamDelta, ActionStep, ToolCall, ToolOutput, FinalAnswerStep
 from smolagents.models import get_clean_message_list
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextIteratorStreamer
-from threading import Thread
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextIteratorStreamer, AutoProcessor, AutoModelForVision2Seq
+from threading import Thread, Lock as ThreadLock
+from PIL import Image
+import io
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,96 @@ class LocalQwenModel(Model):
                 content=new_text
             )
 
+class VisionTool(Tool):
+    name = "analyze_screen"
+    description = "Analyze the latest screen frame to answer a question. Use this tool when the user asks you to 'see', 'look', or describe what is on the screen. CRITICAL USAGE RULE: DO NOT use 'import' statements to load this tool. It is already injected into your environment. You must call it directly like this: `description = analyze_screen(question='what do you see?')`"
+    inputs = {
+        "question": {
+            "type": "string",
+            "description": "The question to ask about the screen content (e.g., 'Describe the error message', 'What is the background color?')."
+        },
+        "answer": {
+            "type": "string",
+            "description": "Optional answer argument. (Ignored)",
+            "nullable": True
+        }
+    }
+    output_type = "string"
+
+    def __init__(self, model, processor, get_image_func, image_lock, **kwargs):
+        super().__init__(**kwargs)
+        self.model = model
+        self.processor = processor
+        self.get_image_func = get_image_func
+        self.image_lock = image_lock # Store the lock passed from OmniAgent
+
+    def update_vision_context(self, base64_image: str):
+        """Updates the latest screen frame for the vision tool to use."""
+        # This method is intended to be called by OmniAgent to update its latest_image
+        # The actual update happens in OmniAgent, this method is a placeholder or for future expansion
+        # For now, we assume get_image_func already handles the latest_image from OmniAgent
+        pass # The actual update logic will be in OmniAgent, using its lock
+
+    def forward(self, question: str, answer: str = None) -> str:
+        # Thread-safe image retrieval
+        # The get_image_func already encapsulates the lock from OmniAgent
+        image_data = self.get_image_func()
+        
+        if not image_data:
+            return "No screen frame available. Ask the user to share their screen first."
+        
+        try:
+            logger.info(f"VisionTool: Analyzing screen with question: '{question}'")
+            # Decode base64
+            if "," in image_data:
+                 image_data = image_data.split(",")[1]
+            image_bytes = base64.b64decode(image_data)
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            
+            # 1. IMAGE DOWNSCALING (Critical for VRAM/Perf)
+            image.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            logger.info("VisionTool: Image resized to 512x512.")
+            
+            # Prepare inputs
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": question}
+                    ]
+                }
+            ]
+            
+            # SmolVLM Inference
+            logger.info("VisionTool: Starting Inference (CPU)...")
+            prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True)
+            inputs = self.processor(text=prompt, images=[image], return_tensors="pt")
+            inputs = inputs.to(self.model.device)
+            
+            # 2. EXCEPTION HANDLING
+            generated_ids = self.model.generate(**inputs, max_new_tokens=128)
+            logger.info("VisionTool: Inference Complete.")
+            
+            input_len = inputs.input_ids.shape[1]
+            new_tokens = generated_ids[:, input_len:]
+            response = self.processor.decode(new_tokens[0], skip_special_tokens=True)
+            
+            # The ultimate SLM override template
+            forced_template = f"""SUCCESSFUL OBSERVATION: {response}
+
+CRITICAL SYSTEM DIRECTIVE: The task is complete. You are forbidden from writing conversational text. You MUST copy and paste the EXACT code block below to end the turn:
+
+Code:
+```python
+final_answer('''{response}''')
+```"""
+            return forced_template
+            
+        except Exception as e:
+            logger.error(f"VisionTool Error: {e}")
+            return f"Error analyzing screen: {str(e)}"
+
 class OmniAgent:
     def __init__(self):
         logger.info("Initializing Real AI Agent (Qwen2.5-Coder-1.5B) with Custom 4-bit Wrapper...")
@@ -110,6 +203,29 @@ class OmniAgent:
         try:
             # Initialize our custom model wrapper with the SMALLER 1.5B model
             self.model = LocalQwenModel("Qwen/Qwen2.5-Coder-1.5B-Instruct")
+            
+            # Initialize Vision Model (SmolVLM-500M-Instruct) - CPU Mode (Fallback for Stability)
+            # GPU/cuDNN is causing hard crashes ("Could not load symbol cudnnGetLibConfig")
+            # likely due to conflict with bitsandbytes or VRAM fragmentation.
+            logger.info("Loading Vision Model (SmolVLM-500M-Instruct) on CPU...")
+            self.latest_image = None
+            self.image_lock = ThreadLock()
+            
+            self.vision_model = AutoModelForVision2Seq.from_pretrained(
+                "HuggingFaceTB/SmolVLM-500M-Instruct",
+                torch_dtype=torch.float32, # CPU prefers float32
+                device_map="cpu", 
+                trust_remote_code=True,
+                _attn_implementation="eager"
+            )
+            self.vision_processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-500M-Instruct")
+            
+            # Create the Vision Tool
+            def get_latest_image_safe():
+                with self.image_lock:
+                    return self.latest_image
+            
+            self.vision_tool = VisionTool(self.vision_model, self.vision_processor, get_latest_image_safe, self.image_lock)
             
             # 1.5B model needs VERY explicit instructions to not just chat
             SYSTEM_PROMPT_ADDITION = """
@@ -125,21 +241,24 @@ IMPORTANT RULES:
 - NEVER use variables that are not defined in your code block.
 - ALWAYS end your code with `final_answer(variable)`.
 - Use `final_answer` ONLY ONCE at the very end of your code.
-- If answering multiple questions, format them into a SINGLE string.
+- PROHIBITED: Do not call `final_answer` multiple times.
+- CRITICAL: If the user asks multiple questions, you MUST solve ALL of them and combine the results into a SINGLE string.
 - DO NOT use `print()` for the final result.
 - DO NOT import imaginary libraries (e.g., `whoami`, `my_library`, `addition`).
 - If asked about yourself, just return the string.
+- CRITICAL RULE: If the user asks you to look at the screen, see the screen, or describe the screen, you MUST immediately call the `analyze_screen` tool. DO NOT write placeholder code. DO NOT guess what is on the screen. You are blind until you call `analyze_screen`.
+- CRITICAL RULE: `analyze_screen` is a BUILT-IN function. DO NOT import it. Just call `analyze_screen(...)`.
 
 EXAMPLES:
 
-User: "What is 5 plus 5 and who created you?"
+User: "Calculate the factorial of 5 and tell me who created you."
 You:
-Thought: I need to calculate the sum and state my creator.
+Thought: I need to calculate 5! and then state my creator. I will combine both into one answer.
 ```python
-sum_result = 5 + 5
+import math
+fact = math.factorial(5)
 creator = "Nihan"
-result_string = f"The sum is {sum_result} and I was created by {creator}."
-final_answer(result_string)
+final_answer(f"The factorial of 5 is {fact}. I was created by {creator}.")
 ```
 
 User: "Calculate the factorial of 5"
@@ -215,7 +334,7 @@ DO NOT write conversational filler. JUST THE THOUGHT AND CODE.
             
             # Create the CodeAgent
             self.agent = CodeAgent(
-                tools=[], 
+                tools=[self.vision_tool], 
                 model=self.model, 
                 add_base_tools=True,
                 max_steps=3, # Fail fast if it loops
@@ -225,7 +344,7 @@ DO NOT write conversational filler. JUST THE THOUGHT AND CODE.
                 description=None,
                 prompt_templates=None,
                 instructions=SYSTEM_PROMPT_ADDITION,
-                additional_authorized_imports=["os", "datetime", "math"],
+                additional_authorized_imports=["os", "datetime", "math", "sympy"],
                 stream_outputs=True # Enable real-time token streaming
             )
             
@@ -234,6 +353,11 @@ DO NOT write conversational filler. JUST THE THOUGHT AND CODE.
         except Exception as e:
             logger.error(f"Failed to initialize AI Agent: {e}")
             raise e
+
+    def update_vision_context(self, base64_image: str):
+        """Updates the latest screen frame for the vision tool to use."""
+        with self.image_lock:
+            self.latest_image = base64_image
 
     def execute_stream(self, task: str):
         logger.info(f"Agent thinking on task: {task} (Streaming)")

@@ -16,3 +16,4 @@ bitsandbytes
 duckduckgo-search
 pandas
 ddgs
+sympy
